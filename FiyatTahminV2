@@ -1,0 +1,219 @@
+library(quantmod)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(httr)
+library(jsonlite)
+library(zoo)
+library(forecast)
+library(imputeTS)
+
+# Hisse sembolleri ve isimleri
+# Türk hisse sembolleri ve isimleri
+semboller <- c("AGHOL.IS", "AKBNK.IS", "AKSA.IS", "ALARK.IS", "ALGYO.IS", "ANSGR.IS",
+               "ARCLK.IS", "ASELS.IS", "GARAN.IS", "SASA.IS", "THYAO.IS", "TKFEN.IS",
+               "TSKB.IS", "TTRAK.IS", "ULKER.IS", "VESTL.IS", "YATAS.IS", "ZOREN.IS")
+
+sembol_isimleri <- c(
+  "ANADOLU GRUP HOLDING", "AKBANK T.A.Ş.", "AKSA AKRILIK KIMYA SANAYII A.Ş.",
+  "ALARKO HOLDING A.Ş.", "ALARKO GAYRIMENKUL YATIRIM ORTAKLIĞI", "ANADOLU SIGORTA A.Ş.",
+  "ARÇELIK A.Ş.", "ASELSAN ELEKTRONIK SANAYI VE TICARET A.Ş.", "TURKIYE GARANTI BANKASI A.Ş.",
+  "SASA POLYESTER SANAYI A.Ş.", "TURK HAVA YOLLARI A.O.", "TEKFEN HOLDING A.Ş.",
+  "TURKIYE SINAI KALKINMA BANKASI A.Ş.", "TURK TRAKTOR VE ZIRAAT MAKINELERI A.Ş.",
+  "ULKER BISKUVI SANAYI A.Ş.", "VESTEL ELEKTRONIK SANAYI VE TICARET A.Ş.",
+  "YATAŞ YATAK VE YORGAN SANAYI VE TICARET A.Ş.", "ZORLU ENERJI ELEKTRIK URETIM A.Ş."
+)
+
+# Amerikan hisse sembolleri ve isimleri
+amerikan_sembolleri <- c("AAPL", "AMZN", "BABA", "GOOGL", "META", "MSFT", "NFLX", "NVDA", "RKLB", "TSLA")
+
+amerikan_sembol_isimleri <- c(
+  "APPLE INC.", "AMAZON.COM, INC.", "ALIBABA GROUP HOLDING LIMITED",
+  "ALPHABET INC.", "META PLATFORMS, INC.", "MICROSOFT CORPORATION",
+  "NETFLIX, INC.", "NVIDIA CORPORATION", "ROCKET LAB USA, INC.", "TESLA, INC."
+)
+
+# Firebase bağlantısı
+firebase_url <- "https://users-59f1f-default-rtdb.europe-west1.firebasedatabase.app/"
+
+# Hisse verisi işleme fonksiyonu
+process_stock_data <- function(sembol, sembol_isim, borsa_tipi) {
+  sembol_for_firebase <- gsub("\\.IS", "", sembol)
+  cat("Hisse (", borsa_tipi, "):", sembol_for_firebase, "\n")
+  
+  # Tahminler listesini tanımlayın
+  tahminler <- list()
+  
+  # Veri çekme
+  veri <- tryCatch({
+    getSymbols(Symbols = sembol, src = "yahoo", from = Sys.Date() - 365, to = Sys.Date(), auto.assign = FALSE, adjust = TRUE)
+  }, error = function(e) {
+    cat("Hisse verisi alınamadı (", borsa_tipi, "):", sembol_for_firebase, " - Hata:", e$message, "\n")
+    return(NULL)
+  })
+  if (is.null(veri)) {
+    cat("Hisse verisi boş, sonraki hisseye geçiliyor (", borsa_tipi, "):", sembol_for_firebase, "\n")
+    return(NULL)
+  }
+  if(length(dim(veri)) < 2) {
+    cat("Hisse verisi uygun formatta değil, sonraki hisseye geçiliyor (", borsa_tipi, "):", sembol_for_firebase, "\n")
+    return(NULL)
+  }
+  
+  veri<-na.omit(veri)
+  if (is.null(veri) || nrow(veri) == 0) {
+    cat("Veri çekme sonrası boş veri oluştu, sonraki hisseye geçiliyor(", borsa_tipi, "):", sembol_for_firebase, "\n")
+    return(NULL)
+  }
+  
+  colnames(veri) <- c("Acilis", "Yuksek", "Dusuk", "Kapanis", "Hacim", "Adj")
+  sonkapanis <- as.numeric(tail(veri$Kapanis, 1))
+  
+  # xts nesnesini data.frame'e dönüştürme
+  veri_df <- data.frame(Date = index(veri), coredata(veri))
+  
+  # Veri ön işleme
+  veri_df <- veri_df %>%
+    mutate(
+      Daily = round((Kapanis - lag(Kapanis, n = 1)) / lag(Kapanis, n = 1) * 100, 2),
+      Tomorrow = lead(Kapanis, n = 1),
+      Three = lead(Kapanis, n = 3),
+      Seven = lead(Kapanis, n = 7)
+    )
+  
+  # Eksik değerleri doğrusal interpolasyon ile doldur
+  veri_df <- veri_df %>%
+    mutate(across(c(Kapanis, Daily, Tomorrow, Three, Seven), ~ na_interpolation(.x, option = "linear")))
+  
+  # Eksik veri kontrolü
+  if (any(is.na(veri_df$Tomorrow))) {
+    cat("Eksik değerler tam doldurulamadı, sonraki hisseye geçiliyor (", borsa_tipi, "):", sembol_for_firebase, "\n")
+    return(NULL)
+  }
+  
+  # Veri bölme
+  div <- createDataPartition(veri_df$Tomorrow, p = 0.8, list = FALSE)
+  egitim <- veri_df[div, ]
+  testing <- veri_df[-div, ]
+  
+  # Hiperparametre Grid
+  tuneGrid_rf <- expand.grid(.mtry = c(2, 4, 6))
+  
+  # Modelleri Eğitme
+  modelrf_tomorrow <- tryCatch({train(Tomorrow ~ ., data = egitim, method = "rf", tuneGrid = tuneGrid_rf, ntree = 500)}, error = function(e){cat("RF Tomorrow model eğitimi hatası:",e$message,"\n"); return(NULL)})
+  modelrf_three <- tryCatch({train(Three ~ ., data = egitim, method = "rf", tuneGrid = tuneGrid_rf, ntree = 500)}, error = function(e){cat("RF Three model eğitimi hatası:",e$message,"\n"); return(NULL)})
+  modelrf_seven <- tryCatch({train(Seven ~ ., data = egitim, method = "rf", tuneGrid = tuneGrid_rf, ntree = 500)}, error = function(e){cat("RF Seven model eğitimi hatası:",e$message,"\n"); return(NULL)})
+  
+  modellm_tomorrow <- tryCatch({train(Tomorrow ~ ., data = egitim, method = "lm")}, error = function(e){cat("LM Tomorrow model eğitimi hatası:",e$message,"\n"); return(NULL)})
+  modellm_three <- tryCatch({train(Three ~ ., data = egitim, method = "lm")}, error = function(e){cat("LM Three model eğitimi hatası:",e$message,"\n"); return(NULL)})
+  modellm_seven <- tryCatch({train(Seven ~ ., data = egitim, method = "lm")}, error = function(e){cat("LM Seven model eğitimi hatası:",e$message,"\n"); return(NULL)})
+  
+  
+  # Zaman Serisi Analizi (ARIMA)
+  ts_data <- ts(egitim$Kapanis, frequency = 5) # frequency=5 iş günleri için (hafta sonları hariç)
+  
+  # auto.arima fonksiyonunu daha tutarlı hale getirin
+  model_arima <- tryCatch({
+    auto.arima(ts_data, stepwise = FALSE, approximation = FALSE, trace = FALSE)
+  }, error = function(e) {
+    cat("ARIMA modeli oluşturulurken hata oluştu (", borsa_tipi, "):", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(model_arima)) {
+    # Tahmin
+    tahmin_arima <- tryCatch({
+      forecast(model_arima, h = 7) # 7 gün sonrasını tahmin et
+    }, error = function(e) {
+      cat("ARIMA tahmini yapılırken hata oluştu (", borsa_tipi, "):", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(tahmin_arima)) {
+      # ARIMA Tahminlerini Tahminler Listesine Ekle
+      tahminler$Tomorrow_ARIMA = tahmin_arima$mean[1]
+      tahminler$Three_ARIMA = tahmin_arima$mean[3]
+      tahminler$Seven_ARIMA = tahmin_arima$mean[7]
+      
+    } else {
+      tahminler$Tomorrow_ARIMA = NA
+      tahminler$Three_ARIMA = NA
+      tahminler$Seven_ARIMA = NA
+      
+    }
+    
+  } else {
+    tahminler$Tomorrow_ARIMA = NA
+    tahminler$Three_ARIMA = NA
+    tahminler$Seven_ARIMA = NA
+  }
+  
+  # Tahminler
+  gelecekveri <- tail(veri_df, 1)
+  if(!is.null(modellm_tomorrow)){tahminler$Tomorrow_LM = predict(modellm_tomorrow, gelecekveri)}else{tahminler$Tomorrow_LM <- NA}
+  if(!is.null(modellm_three)){tahminler$Three_LM = predict(modellm_three, gelecekveri)}else{tahminler$Three_LM <- NA}
+  if(!is.null(modellm_seven)){tahminler$Seven_LM = predict(modellm_seven, gelecekveri)}else{tahminler$Seven_LM <- NA}
+  
+  if(!is.null(modelrf_tomorrow)){tahminler$Tomorrow_RF = predict(modelrf_tomorrow, gelecekveri)}else{tahminler$Tomorrow_RF <- NA}
+  if(!is.null(modelrf_three)){tahminler$Three_RF = predict(modelrf_three, gelecekveri)}else{tahminler$Three_RF <- NA}
+  if(!is.null(modelrf_seven)){tahminler$Seven_RF = predict(modelrf_seven, gelecekveri)}else{tahminler$Seven_RF <- NA}
+  
+  cat("Tahminler (", borsa_tipi, "):\n")
+  for (model_adi in names(tahminler)) {
+    cat("Model:", model_adi, "\n")
+    sonuclar <- tahminler[[model_adi]]
+    cat(sonuclar, ":", "\n")
+    cat("--------------------\n")
+  }
+  
+  # Firebase'e gönderilecek veri
+  data_to_send <- list(
+    Kapanis = sonkapanis,
+    Daily = as.numeric(tail(veri_df$Daily, 1)),
+    Tahminler = tahminler,
+    Tarih = as.character(Sys.Date()),
+    Sembol_Ismi = sembol_isim
+  )
+  
+  url <- paste0(firebase_url, "hisse_verileri/", ifelse(borsa_tipi == "BIST", "borsa_istanbul", "amerikan_borsa"), "/", sembol_for_firebase, ".json")
+  
+  response <- tryCatch({
+    httr::PATCH(url, body = toJSON(data_to_send), encode = "json")
+  }, error = function(e) {
+    cat("Firebase'e veri gönderilirken hata oluştu (", borsa_tipi, "):", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(response)) {
+    cat(sembol_for_firebase, " için sonuçlar Firebase'e kaydedildi (", borsa_tipi, ").\n")
+  }
+}
+
+while(TRUE) {
+  start_time <- Sys.time()
+  cat("Çalışma Başladı:", format(start_time, "%Y-%m-%d %H:%M:%S"), "\n")
+  
+  tryCatch({
+    # Borsa İstanbul Verileri
+    for (i in seq_along(semboller)) {
+      process_stock_data(semboller[i], sembol_isimleri[i], "BIST")
+    }
+    
+    # Amerikan Borsası Verileri
+    for (i in seq_along(amerikan_sembolleri)) {
+      process_stock_data(amerikan_sembolleri[i], amerikan_sembol_isimleri[i], "Amerikan")
+    }
+    
+    end_time <- Sys.time()
+    cat("Çalışma Bitti:", format(end_time, "%Y-%m-%d %H:%M:%S"), "\n")
+    duration <- difftime(end_time, start_time, units = "secs")
+    cat("Çalışma Süresi:", round(duration,2), "saniye \n")
+    
+    Sys.sleep(86400)
+    cat("24 saat beklendi, yeni döngü başlıyor...\n")
+    
+  }, error = function(e) {
+    cat("Beklenmeyen bir hata oluştu, döngü durduruluyor:", e$message, "\n")
+    stop("Hata nedeniyle durduruldu.")
+  })
+}
