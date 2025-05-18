@@ -46,7 +46,7 @@ amerikan_sembol_isimleri <- c(
 )
 
 # Firebase bağlantısı
-firebase_url <- "https://users-59f1f-default-rtdb.europe-west1.firebasedatabase.app/"
+firebase_url <- ""
 
 # Hisse verisi işleme fonksiyonu
 process_stock_data <- function(sembol, sembol_isim, borsa_tipi) {
